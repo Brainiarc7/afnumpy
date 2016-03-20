@@ -3,10 +3,10 @@ import arrayfire
 import sys
 import numpy
 import numbers
-import private_utils as pu
+from . import private_utils as pu
 import afnumpy
-import indexing
-from decorators import *
+from . import indexing
+from .decorators import *
 import collections
 
 def fromstring(string, dtype=float, count=-1, sep=''):
@@ -41,15 +41,17 @@ def array(object, dtype=None, copy=True, order=None, subok=False, ndmin=0):
             s = arrayfire.cast(object.d_array.copy(), pu.typemap(dtype))
         else:
             s = arrayfire.cast(object.d_array, pu.typemap(dtype))
-        return ndarray(shape, dtype=dtype, af_array=s)
+        a = ndarray(shape, dtype=dtype, af_array=s)
+        a._eval()
+        return a
     elif(isinstance(object, numpy.ndarray)):
         return ndarray(shape, dtype=dtype, buffer=numpy.ascontiguousarray(object.astype(dtype, copy=copy)))
     else:
         raise AssertionError
-        
+
 def arange(start, stop = None, step = None, dtype=None):
-    return afnumpy.array(numpy.arange(start,stop,step,dtype))        
- 
+    return afnumpy.array(numpy.arange(start,stop,step,dtype))
+
 def where(condition, x=pu.dummy, y=pu.dummy):
     a = condition
     s = arrayfire.where(a.d_array)
@@ -61,9 +63,9 @@ def where(condition, x=pu.dummy, y=pu.dummy):
         idx = []
         mult = 1
         for i in a.shape[::-1]:
-            mult *= i
-            idx = [s % mult] + idx 
-            s /= mult
+            mult = i
+            idx = [s % mult] + idx
+            s //= mult
         idx = tuple(idx)
         return idx
     elif(x is not pu.dummy and y is not pu.dummy):
@@ -124,10 +126,11 @@ class ndarray(object):
         if af_array is not None and self.d_array.dims() != pu.c2f(self._shape):
             self.__reshape__(self._shape)
 
-        
+
     def __repr__(self):
-        arrayfire.backend.get().af_get_data_ptr(ctypes.c_void_p(self.h_array.ctypes.data), self.d_array.arr)
-        return self.h_array.__repr__()        
+        if self.size:
+            arrayfire.backend.get().af_get_data_ptr(ctypes.c_void_p(self.h_array.ctypes.data), self.d_array.arr)
+        return self.h_array.__repr__()
 
     def __str__(self):
         return self.__repr__()
@@ -196,9 +199,28 @@ class ndarray(object):
         a._eval()
         return a
 
+    __floordiv__ = __div__
+
+    @ufunc
+    def __truediv__(self, other):
+        # Check if we need to cast input to floating point to get a true division
+        if(pu.isintegertype(self) and pu.isintegertype(other)):
+            s = self.astype(numpy.float32).d_array / pu.raw(other)
+        else:
+            s = self.d_array / pu.raw(other)
+        a = ndarray(self.shape, dtype=pu.typemap(s.dtype()), af_array=s)
+        a._eval()
+        return a
+
     @iufunc
     def __idiv__(self, other):
-        afnumpy.divide(self, pu.raw(other), out=self)
+        afnumpy.floor_divide(self, pu.raw(other), out=self)
+        self._eval()
+        return self
+
+    @iufunc
+    def __itruediv__(self, other):
+        afnumpy.true_divide(self, pu.raw(other), out=self)
         self._eval()
         return self
 
@@ -207,7 +229,18 @@ class ndarray(object):
         a = ndarray(self.shape, dtype=pu.typemap(s.dtype()), af_array=s)
         a._eval()
         return a
-        
+
+
+    def __rtruediv__(self, other):
+        # Check if we need to cast input to floating point to get a true division
+        if(pu.isintegertype(self) and pu.isintegertype(other)):
+            s = pu.raw(other) / self.astype(numpy.float32).d_array
+        else:
+            s = pu.raw(other) / self.d_array
+        a = ndarray(self.shape, dtype=pu.typemap(s.dtype()), af_array=s)
+        a._eval()
+        return a
+
     def __pow__(self, other):
         if(isinstance(other, numbers.Number) and numpy.issubdtype(type(other), numpy.float) and
            numpy.issubdtype(self.dtype, numpy.integer)):
@@ -298,16 +331,14 @@ class ndarray(object):
         return self.shape[0]
 
     def __mod__(self, other):
-        a = self / other
-        if numpy.issubdtype(a.dtype, numpy.float):
-            out = self - afnumpy.floor(self / other) * other
-        else:
-            out = self - a * other
-        out._eval()
-        return out
+        s = self.d_array % pu.raw(other)
+        a = ndarray(self.shape, dtype=pu.typemap(s.dtype()), af_array=s)
+        a._eval()
+        return a
 
     def __rmod__(self, other):
-        a = other - afnumpy.floor(other / self) * self
+        s = pu.raw(other) % self.d_array
+        a = ndarray(self.shape, dtype=pu.typemap(s.dtype()), af_array=s)
         a._eval()
         return a
 
@@ -328,7 +359,7 @@ class ndarray(object):
         self.__reshape__(value)
 
     @property
-    def flat(self):        
+    def flat(self):
         # Currently arrayfire.flat is doing unnecessary copies
         # ret = ndarray(self.size, dtype=self.dtype, af_array=arrayfire.flat(self.d_array))
         ret = self.reshape(-1)
@@ -377,7 +408,7 @@ class ndarray(object):
         ret._base = a
         ret._base_index = (Ellipsis, slice(1,None,2))
         return ret
- 
+
     def ravel(self, order=None):
         if(order != None and order != 'K' and order != 'C'):
             raise NotImplementedError('order %s not supported' % (order))
@@ -392,12 +423,16 @@ class ndarray(object):
     def __getitem__(self, args):
         if not isinstance(args, tuple):
             args = (args,)
-        idx, new_shape, input_shape = indexing.__convert_dim__(self.shape, args)
+        try:
+            idx, new_shape, input_shape = indexing.__convert_dim__(self.shape, args)
+        except NotImplementedError:
+            # Slow indexing method for not currently implemented fancy indexing
+            return afnumpy.array(numpy.array(self).__getitem__(args))
         if numpy.prod(new_shape) == 0:
             # We're gonna end up with an empty array
             # As we don't yet support empty arrays return an empty numpy array
             return numpy.empty(new_shape, dtype=self.dtype)
-            
+
         if any(x is None for x in idx):
             # one of the indices is empty
             return ndarray(indexing.__index_shape__(self.shape, idx), dtype=self.dtype)
@@ -416,27 +451,35 @@ class ndarray(object):
 
         return array
 
-    def __setitem__(self, idx, value):  
-        idx, idx_shape, input_shape = indexing.__convert_dim__(self.shape, idx)
+    def __setitem__(self, idx, value):
+        try:
+            idx, idx_shape, input_shape = indexing.__convert_dim__(self.shape, idx)
+        except NotImplementedError:
+            # Slow indexing method for not currently implemented fancy indexing
+            a = numpy.array(self)
+            a.__setitem__(idx, value)
+            self[...] = afnumpy.array(a)
+            return
+
         if numpy.prod(idx_shape) == 0:
             # We've selected an empty array
             # No need to do anything
             return
         if any(x is None for x in idx):
             # one of the indices is empty
-            return            
+            return
         idx = tuple(idx)
         if len(idx) == 0:
             idx = tuple([0])
-        if(isinstance(value, ndarray)):
-            if(value.dtype != self.dtype):
-                raise TypeError('left hand side must have same dtype as right hand side')
-            value = indexing.__expand_dim__(self.shape, value, idx).d_array
-        elif(isinstance(value, numbers.Number)):
+        if(isinstance(value, numbers.Number)):
             pass
+        elif(isinstance(value, ndarray)):
+            if(value.dtype != self.dtype):
+                value.astype(self.dtype)
+            value = indexing.__expand_dim__(self.shape, value, idx).d_array
         else:
             raise NotImplementedError('values must be a afnumpy.ndarray')
-        self.reshape(input_shape).d_array[idx] = value            
+        self.reshape(input_shape).d_array[idx] = value
         # This is a hack to be able to make it look like arrays with stride[0] > 1 can still be views
         # In practise right now it only applies to ndarray.real and ndarray.imag
         try:
@@ -445,7 +488,8 @@ class ndarray(object):
             pass
 
     def __array__(self, dtype=None):
-        arrayfire.backend.get().af_get_data_ptr(ctypes.c_void_p(self.h_array.ctypes.data), self.d_array.arr)
+        if self.size:
+            arrayfire.backend.get().af_get_data_ptr(ctypes.c_void_p(self.h_array.ctypes.data), self.d_array.arr)
         if dtype is None:
             return numpy.copy(self.h_array)
         else:
@@ -477,14 +521,14 @@ class ndarray(object):
         a = array(self, copy=False)
         a.__reshape__(shape, order)
         return a
-        
-    # In place reshape    
+
+    # In place reshape
     def __reshape__(self, newshape, order = 'C'):
         if(order is not 'C'):
             raise NotImplementedError
         if isinstance(newshape,numbers.Number):
             newshape = (newshape,)
-        # Replace a possible -1 with the 
+        # Replace a possible -1 with the
         if -1 in newshape:
             newshape = list(newshape)
             i = newshape.index(-1)
@@ -511,7 +555,7 @@ class ndarray(object):
 
         self.h_array.shape = newshape
         self._shape = tuple(newshape)
-        
+
     def flatten(self):
         return afnumpy.reshape(self, self.size)
 
@@ -531,9 +575,10 @@ class ndarray(object):
                 raise NotImplementedError('only casting=unsafe implemented')
             if(copy == False and order == 'K' and dtype == self.dtype):
                 return self
-#            s = self.d_array.astype(pu.typemap(dtype))
             s = arrayfire.cast(self.d_array, pu.typemap(dtype))
-            return ndarray(self.shape, dtype=dtype, af_array=s)
+            a = ndarray(self.shape, dtype=dtype, af_array=s)
+            a._eval()
+            return a
         else:
             return array(self.h_array.astype(dtype, order, casting, subok, copy), dtype=dtype)
 
@@ -547,7 +592,7 @@ class ndarray(object):
             out[:] = ret[:]
         return ret
 
-        
+
     def take(self, indices, axis=None, out=None, mode='raise'):
         if mode != 'raise':
             raise NotImplementedError('only supports mode=raise')
@@ -620,7 +665,7 @@ class ndarray(object):
             newshape.pop(a)
         return self.reshape(newshape)
 
-    @property            
+    @property
     def T(self):
         if self.ndim < 2:
             return self
@@ -651,11 +696,11 @@ class ndarray(object):
             return ndarray(shape, dtype=pu.typemap(idx.dtype()), af_array=idx)
         else:
             return ndarray(shape, dtype=pu.typemap(idx.dtype()), af_array=idx)[()]
-            
-        
+
+
     def argsort(self, axis=-1, kind='quicksort', order=None):
         if kind != 'quicksort':
-            print "argsort 'kind' argument ignored"
+            print( "argsort 'kind' argument ignored" )
         if order is not None:
             raise ValueError('order argument is not supported')
         if(axis < 0):
@@ -663,7 +708,7 @@ class ndarray(object):
         val, idx = arrayfire.sort_index(self.d_array, pu.c2f(self.shape, axis))
         return ndarray(self.shape, dtype=pu.typemap(idx.dtype()), af_array=idx)
 
-    @property            
+    @property
     def base(self):
         return self._base
 
@@ -676,7 +721,7 @@ class ndarray(object):
             if len(strides) < self.ndim and self.ndim > 1:
                 strides = (strides[0]*self.shape[1],) + strides
             strides = tuple([s*self.dtype.itemsize for s in strides])
-        else:        
+        else:
             idx = (slice(1,None),)
             base_addr = self.d_array.device_ptr()
             dims = self.d_array.dims()
@@ -686,7 +731,7 @@ class ndarray(object):
                 if(dims[i] > 1):
                     strides = (self.d_array[idx].device_ptr()-base_addr,)+strides
                 else:
-                    if len(strides):                    
+                    if len(strides):
                         strides = (dims[i-1]*numpy.prod(strides),)+strides
                     else:
                         strides = (self.itemsize,)+strides
@@ -708,3 +753,18 @@ class ndarray(object):
 
     def copy(self, order='C'):
         return array(self, copy=True, order=order)
+
+    def nonzero(self):
+        s = arrayfire.where(self.d_array)
+        s = ndarray(pu.af_shape(s), dtype=numpy.uint32,
+                    af_array=s).astype(numpy.int64)
+        # TODO: Unexplained eval
+        s.eval()
+        idx = []
+        mult = 1
+        for i in self.shape[::-1]:
+            mult = i
+            idx = [s % mult] + idx
+            s //= mult
+        idx = tuple(idx)
+        return idx
